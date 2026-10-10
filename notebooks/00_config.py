@@ -5,7 +5,7 @@
 # ///
 # MAGIC %md
 # MAGIC # 00_config
-# MAGIC Shared settings used by every notebook: table names, explicit schemas, the Excel parser, and the logging function.
+# MAGIC Shared settings used by every notebook: table names, explicit schemas, the Excel and PDF parsers, and the logging function.
 # MAGIC Other notebooks load this one with `%run ./00_config`.
 
 # COMMAND ----------
@@ -24,7 +24,8 @@ from pyspark.sql.types import (
 # ---- names and default paths (change only here) ----
 CATALOG = "workspace"
 SCHEMA = "spi"
-RAW_FOLDER = "/Volumes/workspace/spi/raw"          # default folder with the Annexure .xlsx files
+RAW_FOLDER = "/Volumes/workspace/spi/raw/xlsx"          # default folder with the Annexure .xlsx files
+RAW_PDF_FOLDER = "/Volumes/workspace/spi/raw/pdf"  # default folder with the Annexure .pdf files (change to your real folder)
 
 BRONZE_TABLE = f"{CATALOG}.{SCHEMA}.bronze_spi_prices"
 SILVER_TABLE = f"{CATALOG}.{SCHEMA}.silver_spi_prices"
@@ -135,7 +136,7 @@ except Exception as e:
 
 CITY_RE = re.compile(r"^\s*(.+?)\s*\((\d{1,2})\)\s*$")          # Islamabad (01)
 DATE_RE = re.compile(r"PRICES ON\s+(\d{2}-\d{2}-\d{4})", re.I)   # PRICES ON 24-09-2026
-FILE_DATE_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")          # Annex_24.09.2026.xlsx
+FILE_DATE_RE = re.compile(r"(\d{2})[._-](\d{2})[._-](\d{4})")      # Annex_24.09.2026.xlsx or Annex-09.10.2025-1.pdf
 
 
 def clean(v):
@@ -189,6 +190,126 @@ def parse_appendix_a(path):
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## PDF parser (same output as the Excel parser)
+# MAGIC The Appendix-A PDF has 3 pages of the same table: cities 1-7, cities 8-14, and cities 15-17
+# MAGIC (the last page also has National Average and week/year comparison columns, which are ignored).
+# MAGIC The summary tables after Appendix-A (fertilizer, cement, CNG, wages, wheat) are skipped.
+
+# COMMAND ----------
+
+try:
+    import pdfplumber
+except ImportError:                      # works inside %run too (a %pip magic would not)
+    import subprocess, sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pdfplumber"])
+    import pdfplumber
+
+# a price cell, or a "not available" marker
+_NUM_RE = re.compile(r"^(?:-?\d+(?:\.\d+)?|N\.?A\.?|-{1,2})$", re.I)
+
+# "Islamabad (01)" inside a header line (may be several cities on one line)
+# (one word per city name: header words from neighbouring columns can land right before it in the text)
+_PDF_CITY_RE = re.compile(r"([A-Za-z][A-Za-z.\-]*)\s*\((\d{2})\)")
+
+# The text of a row is "<description><unit>" with no clean gap, so we recognise the unit at the end.
+_UNIT_RE = re.compile(
+    r"(Bag \d+(?:\.\d+)? ?Kg"                       # Bag 20 Kg
+    r"|Each|Pair|MMBTU"
+    r"|Per (?:Unit|Litre|Plate|Cup|Minute)"
+    r"|\d+(?:\.\d+)? ?(?:Kg|Ltr|Dozen|mtr|gm))$",   # 1 Kg, 1 Ltr, 1 Dozen, 1 mtr, 40 Kg
+    re.I,
+)
+
+
+def _split_desc_unit(text):
+    m = _UNIT_RE.search(text)
+    if not m:
+        return text.strip(), None
+    return text[:m.start()].strip(), re.sub(r"\s+", " ", m.group(1)).strip()
+
+
+def parse_pdf_page_text(text, file_name, price_date=None):
+    """
+    Parse the text of ONE Appendix-A page.
+    Returns (rows, price_date). Rows have the same shape as parse_appendix_a():
+    (source_file, price_date_text, item_sl_no, item_description, unit, city_raw, min, avg, max)
+    """
+    lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines()]
+    lines = [l for l in lines if l]
+
+    # pass 1: this page's city list (in column order) and the date
+    cities = []
+    for l in lines:
+        m = DATE_RE.search(l)
+        if m:
+            price_date = m.group(1)
+        if not l[0].isdigit():
+            cities += [f"{n.strip()} ({c})" for n, c in _PDF_CITY_RE.findall(l)]
+    if not cities:
+        return [], price_date            # not an Appendix-A page (e.g. the summary tables)
+
+    # pass 2: item rows look like   <sl> <description> <unit> <price x 3 per city ...> <sl>
+    rows = []
+    for l in lines:
+        t = l.split(" ")
+        if len(t) < 5 or not t[0].isdigit() or t[-1] != t[0]:
+            continue                     # summary-table rows do not end with the serial number again
+        body = t[1:-1]
+        k = len(body)
+        while k > 0 and _NUM_RE.match(body[k - 1]):
+            k -= 1
+        nums, label = body[k:], " ".join(body[:k])
+        if not label or len(nums) < 3 * len(cities):
+            continue
+        desc, unit = _split_desc_unit(label)
+        for i, city in enumerate(cities):
+            rows.append((file_name, price_date, t[0], desc, unit, city,
+                         nums[3 * i], nums[3 * i + 1], nums[3 * i + 2]))
+    return rows, price_date
+
+
+def parse_appendix_a_pdf(path):
+    file_name = path.split("/")[-1]
+    out, price_date = [], None
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            rows, price_date = parse_pdf_page_text(page.extract_text(use_text_flow=True, x_tolerance=1.5) or "", file_name, price_date)
+            out.extend(rows)
+    if not out:
+        raise ValueError("No item rows found in the PDF. The layout may have changed or it may be a scanned image.")
+    expected = EXPECTED_CITIES * EXPECTED_ITEMS
+    if len(out) != expected:
+        print(f"WARNING {file_name}: parsed {len(out)} rows, expected {expected}")
+    return out
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## One entry point for both file types
+# MAGIC The ingest notebook should call `parse_file(path)` instead of calling the Excel parser directly.
+
+# COMMAND ----------
+
+def parse_file(path):
+    ext = path.lower().rsplit(".", 1)[-1]
+    if ext in ("xlsx", "xls"):
+        rows = parse_appendix_a(path)
+    elif ext == "pdf":
+        rows = parse_appendix_a_pdf(path)
+    else:
+        raise ValueError(f"Unsupported file type: {path}")
+
+    # If the date was not found inside the file, use the date in the file name (Annex_24.09.2026.xlsx)
+    fd = date_from_filename(path.split("/")[-1])
+    if fd is not None:
+        fallback = fd.strftime("%d-%m-%Y")
+        rows = [(r[0], r[1] or fallback) + r[2:] for r in rows]
+    return rows
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Logging function (one row in pipeline_execution_logs)
 
 # COMMAND ----------
@@ -200,3 +321,6 @@ def write_log(batch_id, layer, run_mode, parameter, start_time, status,
     (spark.createDataFrame(row, StructType(LOG_DATA_FIELDS))
           .withColumn("load_timestamp", F.current_timestamp())
           .write.mode("append").saveAsTable(LOG_TABLE))
+
+# COMMAND ----------
+

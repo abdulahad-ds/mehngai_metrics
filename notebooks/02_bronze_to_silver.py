@@ -42,7 +42,21 @@ ensure_tables()
 PRICE_DATE = F.expr("cast(try_to_timestamp(price_date_text, 'dd-MM-yyyy') as date)")   # NULL if not a date
 MISSING_MARKERS = ["N.A.", "NA", "N/A", "-", ""]    # text PBS uses when a price is not available
 
-
+def item_reference():
+    """One clean name and unit per item_no, taken from the most recent week (xlsx first)."""
+    a = (spark.table(BRONZE_TABLE)
+         .withColumn("price_date", PRICE_DATE)
+         .withColumn("item_no", F.expr("try_cast(item_sl_no as int)"))
+         .filter(F.col("price_date").isNotNull() & F.col("item_no").isNotNull()))
+    w = Window.partitionBy("item_no").orderBy(
+        F.col("price_date").desc(), F.col("source_file").endswith(".xlsx").desc(),
+        F.col("load_timestamp").desc())
+    return (a.withColumn("rn", F.row_number().over(w)).filter("rn = 1")
+             .select("item_no",
+                     F.regexp_replace(F.regexp_replace(F.trim("item_description"), r"[\s*]+$", ""),
+                                      r"\s+", " ").alias("ref_name"),
+                     F.trim("unit").alias("ref_unit")))
+    
 def build_silver(bronze):
     """Returns (good_rows, rejected_rows) as two DataFrames."""
     b = (bronze
@@ -100,6 +114,10 @@ def build_silver(bronze):
                  (~F.col("not_available")).alias("is_available"),
                  "source_file", F.lit(batch_id).alias("batch_id"),
                  F.current_timestamp().alias("load_timestamp")))
+    good = (good.join(F.broadcast(item_reference()), "item_no", "left")
+            .withColumn("item_name", F.coalesce("ref_name", "item_name"))
+            .withColumn("unit", F.coalesce("ref_unit", "unit"))
+            .select([f.name for f in SILVER_SCHEMA.fields]))
     return good, rejected
 
 # COMMAND ----------
@@ -164,7 +182,7 @@ display(spark.table(LOG_TABLE).filter(F.col("batch_id") == batch_id))
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC SELECT * FROM workspace.spi.silver_spi_prices WHERE item_no = 1 order by avg_price ;
+# MAGIC SELECT  FROM workspace.spi.silver_spi_prices group by city_name having count (distinct city_name) >1;
 
 # COMMAND ----------
 
