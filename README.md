@@ -14,6 +14,7 @@ A PySpark pipeline that loads the weekly **Sensitive Price Indicator (SPI) Annex
 ```
 notebooks/
   00_config.py              shared settings, explicit schemas, Excel + PDF parsers, logging function
+  01_download_annexures
   01_raw_to_bronze.py       Raw -> Bronze (parameterised, MERGE)
   02_bronze_to_silver.py    Bronze -> Silver (parameterised, MERGE, quarantine)
 README.md
