@@ -178,11 +178,3 @@ except Exception as e:
 # COMMAND ----------
 
 display(spark.table(LOG_TABLE).filter(F.col("batch_id") == batch_id))
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC SELECT  FROM workspace.spi.silver_spi_prices group by city_name having count (distinct city_name) >1;
-
-# COMMAND ----------
-
