@@ -32,11 +32,16 @@ workspace.spi.bronze_spi_prices
 workspace.spi.silver_spi_prices        workspace.spi.silver_spi_quarantine (rejected rows)
 
 Every step writes to workspace.spi.pipeline_execution_logs
+
+Weekly automation (a scheduled Databricks Job):
+   01b_download_latest -> 01_raw_to_bronze -> 02_bronze_to_silver
 ```
 
 Why the scraper runs on a PC: the table on the PBS page is filled in by JavaScript, so a browser is needed to read it, and the Databricks compute used for this project cannot install one. The scraper produces a CSV of annexure links (one row per week), and a Databricks notebook downloads the files listed in it.
 
 Annexure selection rule: for each week, if an Excel annexure exists only the xlsx is saved, otherwise the pdf is saved. Links are chosen by file extension and file name (`annex` in the name), not by table column, because the website sometimes puts the xlsx in the pdf column or swaps the annexure and summary links. Links whose file name carries a different week's date are rejected.
+
+For the weekly automated load no CSV and no browser are needed. `01b_download_latest` reads the newest links from the plain HTML of the price-statistics page and also tries the usual file name (`Annex_DD.MM.YYYY.xlsx`, then `.pdf`) for the last few Thursdays, so a week missed by an earlier run is caught up. The full-history download from the CSV (`01_download_annexures`) is used for the initial load and for weeks whose file name does not follow the usual pattern.
 
 ## 2. Repository layout
 
@@ -44,7 +49,8 @@ Annexure selection rule: for each week, if an Excel annexure exists only the xls
 |---|---|
 | `pbs_spi_scraper.py` | Runs on a PC with Playwright. Reads the SPI table and writes `spi_weeks_flags.csv`. |
 | `00_config.py` | Shared settings: table names, explicit schemas, Excel and PDF parsers, `ensure_tables()`, `write_log()`. Loaded by the other notebooks with `%run ./00_config`. |
-| `01_download_annexures.py` | Downloads the annexures listed in the CSV into the raw volume. |
+| `01_download_annexures.py` | Downloads the annexures listed in the CSV into the raw volume (initial load and backfills). |
+| `01b_download_latest.py` | Finds and downloads the newest weekly annexure(s) without a CSV or browser. First step of the weekly job. |
 | `01_raw_to_bronze.py` | Parses the xlsx and pdf files and merges them into Bronze. |
 | `02_bronze_to_silver.py` | Casts, validates and merges Bronze into Silver, and quarantines bad rows. |
 | `proof/` | Exported notebook outputs (HTML) showing the pipeline running. |
@@ -251,6 +257,25 @@ Run `01_raw_to_bronze` with `run_mode = incremental` and every other widget empt
 
 Backfills never create duplicates, and unchanged rows are not rewritten. The same widgets can be passed as job parameters when the notebooks are scheduled in a Databricks Job.
 
+### 5.6 Weekly automated load
+
+The weekly load is a Databricks Job with three tasks that run in order:
+
+| Task | Notebook | Parameters |
+|---|---|---|
+| 1 | `01b_download_latest` | `weeks_back = 4` (how many recent Thursdays to check) |
+| 2 | `01_raw_to_bronze` | `run_mode = incremental` |
+| 3 | `02_bronze_to_silver` | `run_mode = incremental` |
+
+Setup: create the Job with these tasks (each depending on the one before), add a schedule with the time zone set to Asia/Karachi, and turn on failure email alerts. Because every step is safe to repeat, the schedule can run daily, or on Thursday, Friday and Saturday, so a late publication is picked up on the next run.
+
+Behaviour:
+
+- `01b_download_latest` skips weeks whose file is already in the raw folders, saves the xlsx if the week has one and the pdf otherwise, and reports weeks that are not published yet instead of failing. It fails only if `pbs.gov.pk` cannot be reached.
+- With `run_mode = incremental`, Raw-to-Bronze loads only files that have not loaded successfully before, so a run with no new file inserts and updates nothing.
+- If a week is reported as not found although it is published, its file name does not follow the usual pattern. Add the week to `spi_weeks_flags.csv`, upload it again and run `01_download_annexures`, then run the two pipeline notebooks.
+- To catch up after a long gap, run `01b_download_latest` with a larger `weeks_back`, or use the backfill options in section 5.5.
+
 ## 6. Verifying the pipeline
 
 Idempotency: run `02_bronze_to_silver` twice on the same data. The second run should print `inserted=0 updated=0`. Then this query should return no rows:
@@ -307,5 +332,8 @@ Exported notebook outputs showing these runs are in `proof/`.
 - Before the first full load of Silver, the PDF parser should be checked on a few files by comparing the parsed rows against the PDF. PDF extraction depends on the page layout, so a layout change shows up as a row-count warning in the log (not 867 rows, 17 cities, 51 items).
 - Two weeks have no usable annexure link on the website and are skipped by the download notebook: 2024-07-04 (only summary files are linked) and 2025-08-21 (the link points to the 13-08-2025 file).
 - The 2025-06-04 annexure link is a generic `Annex.pdf` with no date in its name, so its week cannot be checked from the file name.
+- The weekly download assumes weeks end on a Thursday and that the newest files either appear in the page HTML or follow the `Annex_DD.MM.YYYY` naming. A week published under a different name must be added through the CSV.
+- If a week is first published as a pdf and the xlsx appears later, the pdf already saved is kept. The data is the same.
+- Bronze-to-Silver reprocesses all matching Bronze rows on every run. Unchanged rows are not rewritten, so the result is correct, but the run time grows with the table size.
 - Delta does not enforce primary keys. Uniqueness comes from the MERGE keys.
 - Only the weekly Appendix-A price table is loaded. The summary tables in the annexure (fertilizer, cement, CNG, wages, wheat) are not.
