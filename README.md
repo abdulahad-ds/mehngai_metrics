@@ -1,224 +1,311 @@
-# Weekly SPI Prices Lakehouse (Bronze / Silver on Databricks)
+# PBS Weekly Sensitive Price Index (SPI) Lakehouse Pipeline
 
-A PySpark pipeline that loads the weekly **Sensitive Price Indicator (SPI) Annexure, Appendix-A "Consumer Prices of Essential Items"** into a Delta Lakehouse on Databricks. Each weekly file lists **51 items** across **17 cities**, with a minimum, average and maximum price per item and city. The files arrive in two formats, Excel (`.xlsx`) and PDF, kept in separate folders. Both formats go through the same pipeline.
+A PySpark pipeline on Databricks that loads the weekly SPI annexures published by the Pakistan Bureau of Statistics (PBS) into a Bronze and Silver Lakehouse. Each weekly annexure holds the minimum, average and maximum price of 51 essential items in 17 cities, so a complete week has 867 rows (17 x 51).
+
+Data source: https://www.pbs.gov.pk/price-statistics/ (Weekly Sensitive Price Index, "Annexure" files).
+
+## Contents
+
+1. [Architecture](#1-architecture)
+2. [Repository layout](#2-repository-layout)
+3. [Data models](#3-data-models)
+4. [How the requirements are met](#4-how-the-requirements-are-met)
+5. [Execution guide](#5-execution-guide)
+6. [Verifying the pipeline](#6-verifying-the-pipeline)
+7. [Known limitations](#7-known-limitations)
+
+## 1. Architecture
 
 ```
- raw .xlsx folder ─┐                                                    ┌─> silver_spi_quarantine (bad records)
-                   ├─> 01_raw_to_bronze ─> bronze_spi_prices ─> 02_bronze_to_silver ─> silver_spi_prices
- raw .pdf  folder ─┘          │                                          │
-                              └────────── pipeline_execution_logs ───────┘
+PBS website
+   |  pbs_spi_scraper.py (run on a PC, writes spi_weeks_flags.csv)
+   v
+spi_weeks_flags.csv  --upload-->  /Volumes/workspace/spi/raw/manifest/
+   |  01_download_annexures
+   v
+/Volumes/workspace/spi/raw/xlsx   and   /Volumes/workspace/spi/raw/pdf
+   |  01_raw_to_bronze        (Excel parser or PDF parser, all values kept as text)
+   v
+workspace.spi.bronze_spi_prices
+   |  02_bronze_to_silver     (typed, cleaned, validated, MERGE)
+   v
+workspace.spi.silver_spi_prices        workspace.spi.silver_spi_quarantine (rejected rows)
+
+Every step writes to workspace.spi.pipeline_execution_logs
 ```
 
-## Repository layout
+Why the scraper runs on a PC: the table on the PBS page is filled in by JavaScript, so a browser is needed to read it, and the Databricks compute used for this project cannot install one. The scraper produces a CSV of annexure links (one row per week), and a Databricks notebook downloads the files listed in it.
 
-```
-notebooks/
-  00_config.py              shared settings, explicit schemas, Excel + PDF parsers, logging function
-  01_download_annexures
-  01_raw_to_bronze.py       Raw -> Bronze (parameterised, MERGE)
-  02_bronze_to_silver.py    Bronze -> Silver (parameterised, MERGE, quarantine)
-README.md
-```
+Annexure selection rule: for each week, if an Excel annexure exists only the xlsx is saved, otherwise the pdf is saved. Links are chosen by file extension and file name (`annex` in the name), not by table column, because the website sometimes puts the xlsx in the pdf column or swaps the annexure and summary links. Links whose file name carries a different week's date are rejected.
 
-All notebooks are committed to this repository; `00_config` is loaded by the other two with `%run ./00_config`.
+## 2. Repository layout
 
-## Data models
+| File | Purpose |
+|---|---|
+| `pbs_spi_scraper.py` | Runs on a PC with Playwright. Reads the SPI table and writes `spi_weeks_flags.csv`. |
+| `00_config.py` | Shared settings: table names, explicit schemas, Excel and PDF parsers, `ensure_tables()`, `write_log()`. Loaded by the other notebooks with `%run ./00_config`. |
+| `01_download_annexures.py` | Downloads the annexures listed in the CSV into the raw volume. |
+| `01_raw_to_bronze.py` | Parses the xlsx and pdf files and merges them into Bronze. |
+| `02_bronze_to_silver.py` | Casts, validates and merges Bronze into Silver, and quarantines bad rows. |
+| `proof/` | Exported notebook outputs (HTML) showing the pipeline running. |
 
-Catalog / schema: `workspace.spi`. Every table has a `load_timestamp` column set when the row is written.
+## 3. Data models
 
-### Bronze: `workspace.spi.bronze_spi_prices`
+All tables are Delta tables in `workspace.spi`. Delta does not enforce primary keys, so each key below is enforced by the `MERGE INTO` join condition that loads the table.
 
-Raw values exactly as parsed from the file; everything the parser reads stays as **text**. One row per file, item and city.
+### 3.1 Bronze: `bronze_spi_prices`
 
-| Column | Type | Null | Description |
+One row per source file, item and city. Every value from the file is kept as text, exactly as parsed. Only the two metadata columns are typed.
+
+Primary key: (`source_file`, `item_sl_no`, `city_raw`)
+
+| Column | Type | Nullable | Description |
 |---|---|---|---|
-| `batch_id` | string | no | Run label of the load that wrote the row (widget `batch_id`) |
-| `source_file` | string | no | File the row came from (lineage) **(PK)** |
-| `price_date_text` | string | yes | `PRICES ON dd-mm-yyyy` text from the file |
-| `item_sl_no` | string | no | Serial number of the item (1-51) **(PK)** |
-| `item_description` | string | yes | Item name |
-| `unit` | string | yes | Unit of the price (`1 Kg`, `Each`, `Per Litre`, ...) |
-| `city_raw` | string | no | City with its code, e.g. `Islamabad (01)` **(PK)** |
-| `min_price_raw` | string | yes | Minimum price, as text |
-| `avg_price_raw` | string | yes | Average price, as text |
-| `max_price_raw` | string | yes | Maximum price, as text |
-| `load_timestamp` | timestamp | no | When the row was loaded |
+| `batch_id` | string | no | Identifier of the run that loaded the row. |
+| `source_file` | string | no | Name of the annexure file, e.g. `Annex_24.09.2026.xlsx`. |
+| `price_date_text` | string | yes | Price date as found in the file (`dd-MM-yyyy`), or taken from the file name if missing in the file. |
+| `item_sl_no` | string | no | Serial number of the item (1 to 51), as text. |
+| `item_description` | string | yes | Item name as written in the file. |
+| `unit` | string | yes | Unit as written in the file, e.g. `20 Kg`. |
+| `city_raw` | string | no | City with its code, e.g. `Islamabad (01)`. |
+| `min_price_raw` | string | yes | Minimum price as text. |
+| `avg_price_raw` | string | yes | Average price as text. |
+| `max_price_raw` | string | yes | Maximum price as text. |
+| `load_timestamp` | timestamp | no | When the row was ingested. |
 
-**Primary key:** (`source_file`, `item_sl_no`, `city_raw`)
+### 3.2 Silver: `silver_spi_prices`
 
-### Silver: `workspace.spi.silver_spi_prices`
+One row per week, city and item, with proper types.
 
-Typed, validated and de-duplicated. One row per price date, city and item, no matter which file format it came from.
+Primary key: (`price_date`, `city_code`, `item_no`)
 
-| Column | Type | Null | Description |
+| Column | Type | Nullable | Description |
 |---|---|---|---|
-| `price_date` | date | no | Date of the prices **(PK)** |
-| `city_code` | int | no | City code from `city_raw`, e.g. 1 **(PK)** |
-| `city_name` | string | yes | City name, e.g. `Islamabad` |
-| `item_no` | int | no | Item serial number **(PK)** |
-| `item_name` | string | yes | Item name |
-| `unit` | string | yes | Unit of the price |
-| `min_price` | double | yes | Minimum price |
-| `avg_price` | double | yes | Average price |
-| `max_price` | double | yes | Maximum price |
-| `is_available` | boolean | no | Whether a usable price exists for that item and city |
-| `source_file` | string | yes | File the record came from |
-| `batch_id` | string | yes | Batch that last wrote the row |
-| `load_timestamp` | timestamp | no | When the row was loaded |
+| `price_date` | date | no | Date of the prices, cast from `price_date_text`. |
+| `city_code` | int | no | City code taken from `city_raw`, e.g. 1. |
+| `city_name` | string | yes | City name taken from `city_raw`, e.g. `Islamabad`. |
+| `item_no` | int | no | Item serial number (1 to 51). |
+| `item_name` | string | yes | One standard name per item (see below). |
+| `unit` | string | yes | One standard unit per item (see below). |
+| `min_price` | double | yes | Minimum price. NULL when not available. |
+| `avg_price` | double | yes | Average price. NULL when not available. |
+| `max_price` | double | yes | Maximum price. NULL when not available. |
+| `is_available` | boolean | no | `false` when the item had no price in that city that week. |
+| `source_file` | string | yes | Bronze file the row came from. |
+| `batch_id` | string | yes | Identifier of the Silver run that wrote the row. |
+| `load_timestamp` | timestamp | no | When the row was processed into Silver. |
 
-**Primary key:** (`price_date`, `city_code`, `item_no`) <!-- CHECK: must match the MERGE ON clause in 02_bronze_to_silver -->
+Standard item names and units: the files word the same item differently over time (for example a trailing `*` on `Electricity Charges for Q1*`, or the Excel and PDF parsers splitting `Wheat Flour` / `Bag 20 Kg` differently). Silver takes one name and unit per `item_no` from its most recent week and strips trailing `*` and extra spaces, so each item has exactly one name and one unit.
 
-Casting done on the way into Silver: `price_date_text` (dd-MM-yyyy) to `date`; `city_raw` split into `city_code` (int) and `city_name`; `item_sl_no` to `int`; the three price columns to `double`. <!-- CHECK: rule used for is_available -->
+### 3.3 Quarantine: `silver_spi_quarantine`
 
-### Quarantine: `workspace.spi.silver_spi_quarantine`
+Bronze rows that could not be cast or failed validation, kept in their original text form with the reason.
 
-Bronze records that fail validation are written here with the reason, and the rest of the batch continues.
+Primary key: (`source_file`, `item_sl_no`, `city_raw`)
 
-| Column | Type | Description |
+| Column | Type | Nullable | Description |
+|---|---|---|---|
+| `batch_id` | string | yes | Run that rejected the row. |
+| `source_file` | string | no | Source file. |
+| `price_date_text` | string | yes | Raw date text. |
+| `item_sl_no` | string | no | Raw item serial number. |
+| `item_description` | string | yes | Raw item name. |
+| `unit` | string | yes | Raw unit. |
+| `city_raw` | string | no | Raw city text. |
+| `min_price_raw` | string | yes | Raw minimum price. |
+| `avg_price_raw` | string | yes | Raw average price. |
+| `max_price_raw` | string | yes | Raw maximum price. |
+| `reject_reason` | string | yes | Why the row was rejected. |
+| `load_timestamp` | timestamp | no | When the row was quarantined. |
+
+### 3.4 Audit log: `pipeline_execution_logs`
+
+One row per processed unit of work.
+
+Primary key: `log_id`
+
+| Column | Type | Nullable | Description |
+|---|---|---|---|
+| `log_id` | string | no | Unique id (UUID) of the log row. |
+| `batch_id` | string | yes | Run identifier. |
+| `layer` | string | no | `Raw-to-Bronze` or `Bronze-to-Silver`. |
+| `run_mode` | string | yes | `full` or `incremental`. |
+| `parameter` | string | yes | File name (Raw-to-Bronze) or the date range / source file filter (Bronze-to-Silver). |
+| `start_time` | timestamp | yes | When processing started. |
+| `end_time` | timestamp | yes | When processing ended. |
+| `status` | string | yes | `Success` or `Failure`. |
+| `rows_inserted` | bigint | yes | Rows inserted by the MERGE. |
+| `rows_updated` | bigint | yes | Rows updated by the MERGE. |
+| `rows_quarantined` | bigint | yes | Rows sent to quarantine. |
+| `message` | string | yes | Warning or error text. |
+| `load_timestamp` | timestamp | no | When the log row was written. |
+
+## 4. How the requirements are met
+
+### Explicit schemas, no inference
+
+Every schema is defined with `StructType` and `StructField` in `00_config.py` (`BRONZE_PARSE_SCHEMA`, `BRONZE_SCHEMA`, `SILVER_SCHEMA`, `QUARANTINE_SCHEMA`, `LOG_SCHEMA`). Files are parsed by our own Excel and PDF parsers into tuples, and the DataFrame is created with the explicit schema. `inferSchema` is never used. `ensure_tables()` creates the tables from these schemas and is safe to run repeatedly.
+
+### Typing and casting
+
+Bronze keeps text. Silver converts with `try_cast` / `try_to_timestamp`: date text to `date`, item and city codes to `int`, prices to `double`. A value that is not valid becomes NULL instead of crashing the batch, and the row is quarantined with a reason.
+
+Silver validation:
+
+- Bad `price_date`, `city_code` or `item_no`: quarantined (`bad date`, `bad city code`, `bad item number`).
+- A price that has text but is not a number: quarantined (`non-numeric price`).
+- A negative price: quarantined (`negative price`).
+- Minimum, average and maximum out of order: quarantined (`min/avg/max out of order`).
+- A price written as `NA`, `N.A.`, `-`, `--` or empty is a normal missing value, not an error. The row is kept with NULL prices and `is_available = false`.
+
+Missing prices are never dropped or filled in Bronze or Silver. Any imputation belongs in a later layer, where the method can be documented.
+
+### Metadata
+
+Every table has a `load_timestamp` column: Bronze, Silver, quarantine and the log table.
+
+### Idempotency
+
+Bronze, Silver and quarantine are all loaded with `MERGE INTO`:
+
+- Bronze joins on (`source_file`, `item_sl_no`, `city_raw`).
+- Silver joins on (`price_date`, `city_code`, `item_no`).
+- Quarantine joins on (`source_file`, `item_sl_no`, `city_raw`).
+
+A matched row is updated only if a value actually changed, otherwise it is left alone. Running the pipeline again on the same data therefore gives `rows_inserted = 0` and `rows_updated = 0`. If the same Silver key arrives from two files (for example an xlsx and a pdf of the same week), one row is kept before the MERGE, because Delta rejects several source rows for one target row.
+
+### Parameterized runs and backfills
+
+No notebook contains a hardcoded date or file path. Folders, date ranges, file names, run mode and batch id are all widgets (see the execution guide). Any historical period can be re-run from raw files to Bronze, or from Bronze to Silver.
+
+### Schema drift
+
+- Raw to Bronze: if a file has no `Appendix-A` sheet, or no item rows can be read, the file fails with a clear error, is logged as `Failure`, and a copy is placed in a `quarantine` folder next to it. The other files continue. If a file parses but does not have 17 cities and 51 items, a warning is written to the log `message`.
+- A new column: `spark.databricks.delta.schema.autoMerge.enabled` is set, so a `MERGE` can add a column that the source gained. Silver selects its columns explicitly, so an extra Bronze column never breaks it.
+- A type change (for example a number arriving as text): `try_cast` yields NULL, and the row is quarantined with a reason, without stopping the batch.
+
+### Audit logging
+
+`write_log()` writes a row to `pipeline_execution_logs` for every unit of work, on success and on failure. Raw-to-Bronze logs one row per file. Bronze-to-Silver logs one row per run, with the date range or source file as the parameter. Each row has the layer, the parameter, start and end times, status, rows inserted, rows updated, rows quarantined and a message.
+
+## 5. Execution guide
+
+### 5.1 One-time setup
+
+1. Create the volume folders: `/Volumes/workspace/spi/raw/xlsx`, `/Volumes/workspace/spi/raw/pdf` and `/Volumes/workspace/spi/raw/manifest`.
+2. On a PC, run the scraper to build the link list:
+
+   ```
+   pip install playwright
+   playwright install chromium
+   python pbs_spi_scraper.py
+   ```
+
+   This writes `spi_weeks_flags.csv`.
+3. Upload `spi_weeks_flags.csv` to `/Volumes/workspace/spi/raw/manifest/`.
+
+Folder defaults live only in `00_config.py` (`RAW_FOLDER`, `RAW_PDF_FOLDER`).
+
+### 5.2 Run order
+
+1. `01_download_annexures`: downloads the files listed in the CSV into the `xlsx` and `pdf` folders. Files that already exist are skipped.
+2. `01_raw_to_bronze`: parses the files into Bronze.
+3. `02_bronze_to_silver`: builds Silver.
+
+### 5.3 Widgets
+
+`01_raw_to_bronze`
+
+| Widget | Meaning |
+|---|---|
+| `run_mode` | `incremental` skips files that already loaded successfully. `full` processes every file in range again (safe, because of MERGE). |
+| `file_types` | `both`, `xlsx` or `pdf`. |
+| `raw_folder` | Folder with the xlsx files. Empty skips Excel. |
+| `raw_pdf_folder` | Folder with the pdf files. Empty skips PDF. |
+| `start_date`, `end_date` | Optional `YYYY-MM-DD`. Only files whose name carries a date in this range are used. |
+| `batch_id` | Optional run label. Empty generates a new one. |
+
+`02_bronze_to_silver`
+
+| Widget | Meaning |
+|---|---|
+| `run_mode` | `incremental` or `full`, recorded in the log. Both are safe to repeat because of MERGE. |
+| `start_date`, `end_date` | Optional `YYYY-MM-DD`. Only Bronze rows with a price date in this range are processed. |
+| `source_file` | Optional. Process only this Bronze file. |
+| `batch_id` | Optional run label. |
+
+### 5.4 Standard incremental load
+
+Run `01_raw_to_bronze` with `run_mode = incremental` and every other widget empty. Only files that have not loaded successfully before are processed. Then run `02_bronze_to_silver` with all widgets empty.
+
+### 5.5 Backfills
+
+| Goal | `01_raw_to_bronze` | `02_bronze_to_silver` |
 |---|---|---|
-| `batch_id` | string | Batch that produced the record |
-| `source_file` | string | File the record came from |
-| `price_date_text`, `item_sl_no`, `item_description`, `unit`, `city_raw` | string | Bronze values, unchanged |
-| `min_price_raw`, `avg_price_raw`, `max_price_raw` | string | Bronze values, unchanged |
-| `reject_reason` | string | Why the record was rejected |
-| `load_timestamp` | timestamp | When it was quarantined |
+| Reload everything | `run_mode = full`, other widgets empty | `run_mode = full`, other widgets empty |
+| Reload a period | `run_mode = full`, `start_date = 2025-01-01`, `end_date = 2025-03-31` | `run_mode = full`, same `start_date` and `end_date` |
+| Reload one week | `run_mode = full`, `start_date` and `end_date` both set to that week's date | `source_file = Annex_24.09.2026.xlsx`, or `start_date` and `end_date` set to that date |
+| Only PDF or only Excel | `file_types = pdf` or `xlsx` | not needed |
+| Files in another folder | set `raw_folder` and/or `raw_pdf_folder` | not needed |
+| Tag a run | set `batch_id` to any label | set `batch_id` to any label |
 
-### Execution log: `workspace.spi.pipeline_execution_logs`
+Backfills never create duplicates, and unchanged rows are not rewritten. The same widgets can be passed as job parameters when the notebooks are scheduled in a Databricks Job.
 
-One row per processed file (Raw-to-Bronze) or per Silver run (Bronze-to-Silver), for both full and incremental loads.
+## 6. Verifying the pipeline
 
-| Column | Type | Description |
-|---|---|---|
-| `log_id` | string | Unique id of the log row **(PK)** |
-| `batch_id` | string | Batch of the run; joins to `batch_id` in Bronze and Silver |
-| `layer` | string | `Raw-to-Bronze` or `Bronze-to-Silver` |
-| `run_mode` | string | `full` or `incremental` |
-| `parameter` | string | File name processed, or the date range for Silver |
-| `start_time`, `end_time` | timestamp | Start and end of the run |
-| `status` | string | `Success` or `Failure` |
-| `rows_inserted`, `rows_updated`, `rows_quarantined` | long | Row counts from MERGE and quarantine |
-| `message` | string | Warning or error text |
-| `load_timestamp` | timestamp | When the log row was written |
-
-## How it works
-
-**Explicit schemas.** All schemas are `StructType`/`StructField` objects defined in `00_config`. No schema inference is used. The parsers return plain text values and the DataFrame is created with `BRONZE_PARSE_SCHEMA`.
-
-**Two file formats, one entry point.** `parse_file(path)` in `00_config` picks the parser by file extension.
-- Excel: reads the `Appendix-A` sheet and finds the city header row.
-- PDF: reads the Appendix-A pages with `pdfplumber` (three pages: cities 1-7, 8-14, 15-17). The summary tables after Appendix-A (fertilizer, cement, CNG, wages, wheat) are ignored.
-- The price date is read from the file; if it is missing, the date in the file name is used.
-
-**Raw to Bronze (`01_raw_to_bronze`).**
-- Files are processed one at a time, so one bad file never stops the others.
-- Rows are written with `MERGE INTO` on (`source_file`, `item_sl_no`, `city_raw`). A matching row is updated only if a value actually changed; otherwise it is left alone.
-- A file that fails to parse is logged as `Failure` and copied to a `quarantine/` folder next to the raw files.
-- A file with an unexpected number of cities or items is still loaded, and a warning is stored in the log `message`.
-
-**Bronze to Silver (`02_bronze_to_silver`).** Casts and validates the Bronze rows, sends bad records to the quarantine table, and merges the good ones into Silver on (`price_date`, `city_code`, `item_no`). <!-- CHECK: describe exactly what the notebook does -->
-
-**Idempotency.** Both layers write with `MERGE INTO`, so running the same input again gives the same tables with no duplicate rows (see "Proof checks" below).
-
-**Schema drift.**
-- Delta schema auto-merge is switched on in `00_config`, so a new source column is added to the target table by MERGE instead of failing it.
-- Bronze keeps every value as text, so a changed data type in the source does not break the load.
-- Rows with values that cannot be cast, or that break a rule, go to `silver_spi_quarantine` with a `reject_reason`.
-- A file whose layout can no longer be parsed is logged as `Failure` and copied to `quarantine/`; the other files still load.
-
-## Setup
-
-1. Use a Databricks workspace (Free Edition works). Clone this repository into the workspace (Workspace > Create > Git folder).
-2. Create two volumes folders for the raw files, for example:
-   - `/Volumes/workspace/spi/raw` for the `.xlsx` files
-   - `/Volumes/workspace/spi/raw_pdf` for the `.pdf` files
-3. If your folders are different, change `RAW_FOLDER` and `RAW_PDF_FOLDER` at the top of `00_config`. (They can also be overridden by widgets at run time.)
-4. `openpyxl` and `pdfplumber` are needed. `01_raw_to_bronze` lists them in its dependency header, and `00_config` installs `pdfplumber` itself if it is missing.
-5. The tables are created automatically on the first run (`ensure_tables()`).
-
-## Running the pipeline
-
-### Parameters
-
-`01_raw_to_bronze` (widgets at the top of the notebook):
-
-| Widget | Values | Meaning |
-|---|---|---|
-| `run_mode` | `incremental` (default), `full` | `incremental` skips files that already have a `Success` row for `Raw-to-Bronze` in the log table. `full` processes every file in range again (safe, because of MERGE). |
-| `file_types` | `both` (default), `xlsx`, `pdf` | Which file types to pick up |
-| `raw_folder` | folder path | Folder with the `.xlsx` files (empty = skip Excel) |
-| `raw_pdf_folder` | folder path | Folder with the `.pdf` files (empty = skip PDF) |
-| `start_date`, `end_date` | `YYYY-MM-DD` or empty | Only files whose name contains a date in this range. Empty = no limit. Files with no date in the name are always included. |
-| `batch_id` | text or empty | Label of the run. Empty = generated automatically. |
-
-`02_bronze_to_silver` takes the same kind of parameters. <!-- CHECK: list the real widget names of 02_bronze_to_silver -->
-
-### Normal incremental load (new weekly files)
-
-1. Put the new `.xlsx` and `.pdf` files into their folders.
-2. Run `01_raw_to_bronze` with the defaults (`run_mode = incremental`, no dates). Only files not yet logged as successful are loaded.
-3. Run `02_bronze_to_silver` with `run_mode = incremental`.
-
-This can be scheduled as a Databricks Job (for example weekly) that runs the two notebooks in order.
-
-### Backfill an older period
-
-Run with `run_mode = full` and a date range. Nothing in the code needs editing.
-
-```python
-# Re-load all files dated in 2025 into Bronze, then rebuild Silver for the same period
-dbutils.notebook.run("01_raw_to_bronze", 3600, {
-    "run_mode": "full", "start_date": "2025-01-01", "end_date": "2025-12-31",
-    "batch_id": "backfill_2025"})
-dbutils.notebook.run("02_bronze_to_silver", 3600, {
-    "run_mode": "full", "start_date": "2025-01-01", "end_date": "2025-12-31",
-    "batch_id": "backfill_2025"})   # CHECK widget names
-```
-
-Other examples:
-- Reload a single file: set `start_date` and `end_date` to that file's date.
-- Excel files only: `file_types = xlsx`.
-- A different folder: set `raw_folder` / `raw_pdf_folder`.
-- A file that was corrected and re-uploaded under the **same name** is skipped in incremental mode; reload it with `run_mode = full`.
-
-## Proof checks (SQL)
-
-**No duplicates after a re-run.** Run the same load twice and compare. Re-running should insert 0 rows and the counts should not change.
+Idempotency: run `02_bronze_to_silver` twice on the same data. The second run should print `inserted=0 updated=0`. Then this query should return no rows:
 
 ```sql
-SELECT COUNT(*) AS bronze_rows FROM workspace.spi.bronze_spi_prices;
-SELECT COUNT(*) AS silver_rows FROM workspace.spi.silver_spi_prices;
-
--- must return no rows
-SELECT source_file, item_sl_no, city_raw, COUNT(*) AS n
-FROM workspace.spi.bronze_spi_prices
-GROUP BY source_file, item_sl_no, city_raw HAVING COUNT(*) > 1;
-
-SELECT price_date, city_code, item_no, COUNT(*) AS n
+SELECT price_date, city_code, item_no, COUNT(*) AS copies
 FROM workspace.spi.silver_spi_prices
-GROUP BY price_date, city_code, item_no HAVING COUNT(*) > 1;
+GROUP BY price_date, city_code, item_no
+HAVING COUNT(*) > 1;
 ```
 
-**Row count per file.** Each file should show 867 rows (51 items x 17 cities) and 17 cities.
+Completeness: every week should show 867 rows, 17 cities and 51 items.
 
 ```sql
-SELECT source_file, price_date_text, COUNT(*) AS row_count, COUNT(DISTINCT city_raw) AS cities
-FROM workspace.spi.bronze_spi_prices
-GROUP BY source_file, price_date_text ORDER BY source_file;
+SELECT price_date, COUNT(*) AS row_count, COUNT(DISTINCT city_code) AS cities,
+       COUNT(DISTINCT item_no) AS items,
+       SUM(CASE WHEN is_available THEN 0 ELSE 1 END) AS unavailable
+FROM workspace.spi.silver_spi_prices
+GROUP BY price_date
+ORDER BY price_date;
 ```
 
-**Execution log.**
+One name and one unit per item (should return no rows):
 
 ```sql
-SELECT layer, run_mode, parameter, start_time, end_time, status,
-       rows_inserted, rows_updated, rows_quarantined, message
+SELECT item_no, COUNT(DISTINCT item_name) AS names, COUNT(DISTINCT unit) AS units
+FROM workspace.spi.silver_spi_prices
+GROUP BY item_no
+HAVING COUNT(DISTINCT item_name) > 1 OR COUNT(DISTINCT unit) > 1;
+```
+
+Rejected rows and why:
+
+```sql
+SELECT source_file, reject_reason, COUNT(*) AS rows_rejected
+FROM workspace.spi.silver_spi_quarantine
+GROUP BY source_file, reject_reason
+ORDER BY source_file;
+```
+
+Audit trail:
+
+```sql
+SELECT layer, parameter, run_mode, status, rows_inserted, rows_updated, rows_quarantined,
+       start_time, end_time, message
 FROM workspace.spi.pipeline_execution_logs
 ORDER BY start_time DESC;
 ```
 
-**Quarantined records.**
+Exported notebook outputs showing these runs are in `proof/`.
 
-```sql
-SELECT reject_reason, COUNT(*) AS n
-FROM workspace.spi.silver_spi_quarantine
-GROUP BY reject_reason;
-```
+## 7. Known limitations
+
+- Before the first full load of Silver, the PDF parser should be checked on a few files by comparing the parsed rows against the PDF. PDF extraction depends on the page layout, so a layout change shows up as a row-count warning in the log (not 867 rows, 17 cities, 51 items).
+- Two weeks have no usable annexure link on the website and are skipped by the download notebook: 2024-07-04 (only summary files are linked) and 2025-08-21 (the link points to the 13-08-2025 file).
+- The 2025-06-04 annexure link is a generic `Annex.pdf` with no date in its name, so its week cannot be checked from the file name.
+- Delta does not enforce primary keys. Uniqueness comes from the MERGE keys.
+- Only the weekly Appendix-A price table is loaded. The summary tables in the annexure (fertilizer, cement, CNG, wages, wheat) are not.
