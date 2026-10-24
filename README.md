@@ -1,10 +1,8 @@
 # Mehngai Metrics
 
-*Mehngai* is the Urdu word for rising prices, and that is what this project tracks.
 
 Every week the Pakistan Bureau of Statistics (PBS) publishes a price survey covering 51 everyday items in 17 cities. Most coverage only quotes the national figure. We wanted the city and item detail, so we built a pipeline on Databricks that loads every weekly release since July 2023, cleans it up, and feeds a Power BI dashboard that shows where prices are climbing and which items are behind it.
 
-It is a semester project for Data Analysis & Visualization (BDS-5A, FAST-NUCES Lahore), written by M. Abdul Ahad and Laiba Shahzad.
 
 ## What the dashboard answers
 
