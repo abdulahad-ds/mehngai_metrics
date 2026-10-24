@@ -8,7 +8,7 @@
 # ]
 # ///
 # MAGIC %md
-# MAGIC # 01_raw_to_bronze
+# MAGIC # 03_raw_to_bronze
 # MAGIC Reads the weekly Annexure files (Excel and PDF, kept in separate folders) and merges them into the Bronze table.
 # MAGIC Both file types go through the same parser entry point (`parse_file`) and land in the same Bronze table.
 # MAGIC
@@ -158,6 +158,3 @@ display(spark.table(LOG_TABLE).orderBy("start_time"))
 # MAGIC FROM workspace.spi.bronze_spi_prices
 # MAGIC GROUP BY source_file, price_date_text
 # MAGIC ORDER BY source_file;
-
-# COMMAND ----------
-

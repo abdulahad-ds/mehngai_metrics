@@ -300,10 +300,16 @@ def parse_file(path):
     else:
         raise ValueError(f"Unsupported file type: {path}")
 
-    # If the date was not found inside the file, use the date in the file name (Annex_24.09.2026.xlsx)
+    # The date inside the file and the date in the file name (Annex_24.09.2026.xlsx) must agree. Silver is keyed on the
+    # price date, so a file published under the wrong week would otherwise silently overwrite that other week.
     fd = date_from_filename(path.split("/")[-1])
     if fd is not None:
         fallback = fd.strftime("%d-%m-%Y")
+        in_file = {r[1] for r in rows if r[1]}
+        wrong = {d for d in in_file if d != fallback}
+        if wrong:
+            raise ValueError(f"Date mismatch: file name says {fallback} but the file contains {sorted(wrong)}")
+        # If the date was not found inside the file, use the date in the file name
         rows = [(r[0], r[1] or fallback) + r[2:] for r in rows]
     return rows
 

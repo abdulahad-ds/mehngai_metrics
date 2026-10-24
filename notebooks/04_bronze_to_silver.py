@@ -4,7 +4,7 @@
 # environment_version = "6"
 # ///
 # MAGIC %md
-# MAGIC # 02_bronze_to_silver
+# MAGIC # 04_bronze_to_silver
 # MAGIC Cleans and casts Bronze rows, sends bad rows to the quarantine table, and merges good rows into Silver.
 # MAGIC
 # MAGIC **Parameters**
@@ -40,7 +40,7 @@ ensure_tables()
 # COMMAND ----------
 
 PRICE_DATE = F.expr("cast(try_to_timestamp(price_date_text, 'dd-MM-yyyy') as date)")   # NULL if not a date
-MISSING_MARKERS = ["N.A.", "NA", "N/A", "-", ""]    # text PBS uses when a price is not available
+MISSING_MARKERS = ["N.A.", "NA", "N/A", "-", "--", ""]    # text PBS uses when a price is not available
 
 def item_reference():
     """One clean name and unit per item_no, taken from the most recent week (xlsx first)."""
@@ -100,9 +100,10 @@ def build_silver(bronze):
         "item_description", "unit", "city_raw", "min_price_raw", "avg_price_raw", "max_price_raw",
         "reject_reason", F.current_timestamp().alias("load_timestamp"))
 
-    # If the same (date, city, item) arrives from two files, keep the newest one.
+    # If the same (date, city, item) arrives from two files, keep the xlsx one (same rule as item_reference), then the newest.
     w = (Window.partitionBy("price_date", "city_code", "item_no")
-               .orderBy(F.col("bronze_load_ts").desc(), F.col("source_file").desc()))
+               .orderBy(F.col("source_file").endswith(".xlsx").desc(), F.col("bronze_load_ts").desc(),
+                        F.col("source_file").desc()))
     good = (b.filter(F.col("reject_reason").isNull())
              .withColumn("rn", F.row_number().over(w)).filter("rn = 1")
              .select(
@@ -155,20 +156,44 @@ try:
     inserted, updated = int(res["num_inserted_rows"]), int(res["num_updated_rows"])
 
     # --- MERGE rejected rows into the quarantine table (so reruns do not duplicate them) ---
+    # Rows of this run's scope that are no longer rejected (the Bronze row was corrected) are deleted from quarantine,
+    # so the table only shows rows that are still bad. Explicit column lists: the helper column must not reach the table.
+    qcols = [f.name for f in QUARANTINE_SCHEMA.fields]
+    cleared = (bronze.select("source_file", "item_sl_no", "city_raw")
+                     .join(rejected.select("source_file", "item_sl_no", "city_raw"),
+                           ["source_file", "item_sl_no", "city_raw"], "left_anti"))
+    q_src = (rejected.withColumn("_clear", F.lit(False))
+             .unionByName(cleared.withColumn("_clear", F.lit(True)), allowMissingColumns=True)
+             .select(*qcols, "_clear"))
+    q_src.createOrReplaceTempView("quarantine_merge_source")
     spark.sql(f"""
         MERGE INTO {QUARANTINE_TABLE} AS t
-        USING quarantine_incoming AS s
+        USING quarantine_merge_source AS s
         ON  t.source_file = s.source_file AND t.item_sl_no = s.item_sl_no AND t.city_raw = s.city_raw
+        WHEN MATCHED AND s._clear THEN DELETE
         WHEN MATCHED AND NOT (t.reject_reason <=> s.reject_reason
                               AND t.min_price_raw <=> s.min_price_raw
                               AND t.avg_price_raw <=> s.avg_price_raw
                               AND t.max_price_raw <=> s.max_price_raw)
-          THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
+          THEN UPDATE SET {", ".join(f"t.{c} = s.{c}" for c in qcols)}
+        WHEN NOT MATCHED AND NOT s._clear
+          THEN INSERT ({", ".join(qcols)}) VALUES ({", ".join(f"s.{c}" for c in qcols)})
     """)
     quarantined = rejected.count()
 
-    write_log(batch_id, "Bronze-to-Silver", run_mode, parameter, started, "Success", inserted, updated, quarantined)
+    # Silver keeps ONE name per item (the newest). Warn when an item was worded differently in the rows just processed,
+    # because the new wording may mean a different series (e.g. a changed tariff slab).
+    clean_name = F.regexp_replace(F.regexp_replace(F.trim("item_description"), r"[\s*]+$", ""), r"\s+", " ")
+    renamed = (bronze.filter(F.col("item_description").isNotNull())
+                     .withColumn("n", clean_name).groupBy("item_sl_no")
+                     .agg(F.countDistinct("n").alias("names"), F.collect_set("n").alias("variants"))
+                     .filter("names > 1").collect())
+    note = None
+    if renamed:
+        note = "WARNING renamed items: " + "; ".join(f"item {r.item_sl_no}: {sorted(r.variants)}" for r in renamed)[:900]
+        print(note)
+
+    write_log(batch_id, "Bronze-to-Silver", run_mode, parameter, started, "Success", inserted, updated, quarantined, note)
     print(f"OK: inserted={inserted} updated={updated} quarantined={quarantined}")
 
 except Exception as e:
@@ -178,3 +203,8 @@ except Exception as e:
 # COMMAND ----------
 
 display(spark.table(LOG_TABLE).filter(F.col("batch_id") == batch_id))
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC select * from spi.silver_spi_prices where price_date=date'2026-10-15' and item_no=42

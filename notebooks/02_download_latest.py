@@ -4,7 +4,7 @@
 # environment_version = "6"
 # ///
 # MAGIC %md
-# MAGIC # 01b_download_latest
+# MAGIC # 02_download_latest
 # MAGIC Weekly job step: finds the newest SPI annexure(s) on pbs.gov.pk and saves them in the raw folders.
 # MAGIC No browser and no CSV needed. Safe to run any number of times: files already saved are skipped,
 # MAGIC and a week that is not published yet is reported, not treated as an error.
@@ -13,7 +13,7 @@
 # MAGIC 1. The latest week's links are in the plain HTML of the price-statistics page. Links with `annex` in the file name are used.
 # MAGIC 2. For the last `weeks_back` Thursdays the usual file name `Annex_DD.MM.YYYY.xlsx` / `.pdf` is also tried, so a missed week is caught up.
 # MAGIC
-# MAGIC Rule (same as `01_download_annexures`): xlsx if the week has one, otherwise pdf.
+# MAGIC Rule (same as `01_download_full`): xlsx if the week has one, otherwise pdf.
 # MAGIC
 # MAGIC **Parameters**
 # MAGIC | Widget | Meaning |
@@ -30,7 +30,8 @@
 import os
 import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urljoin, urlparse, unquote
 
 import requests
@@ -69,8 +70,12 @@ def valid(kind, body):
     return body[:2] == b"PK" if kind == "xlsx" else b"%PDF" in body[:1024]
 
 
+errors = []     # (url, reason) for failures that are NOT a plain 404, so an outage is not reported as "not published"
+
+
 def fetch(url):
-    """File bytes, or None if the file is not there (404) or not a real file."""
+    """File bytes, or None if the file is not there (404) or could not be downloaded (reason kept in `errors`)."""
+    reason = None
     for attempt in range(3):
         try:
             r = session.get(url, timeout=60)
@@ -78,9 +83,11 @@ def fetch(url):
                 return None
             if r.status_code == 200 and r.content:
                 return r.content
-        except requests.RequestException:
-            pass
+            reason = f"HTTP {r.status_code}"
+        except requests.RequestException as e:
+            reason = type(e).__name__
         time.sleep(1 + attempt * 2)
+    errors.append((url, reason))
     return None
 
 # COMMAND ----------
@@ -100,7 +107,7 @@ for href in re.findall(r"""href=["']([^"']+?\.(?:xlsx|pdf))(?:\?[^"']*)?["']""",
         found.setdefault(wk, {}).setdefault(f.rsplit(".", 1)[-1], u)
 
 # 2) Usual file names for the last few Thursdays (catches a week the job missed).
-today = date.today()
+today = datetime.now(ZoneInfo("Asia/Karachi")).date()      # PBS publishes in Pakistan time; the cluster clock is UTC
 last_thu = today - timedelta(days=(today.weekday() - 3) % 7)
 for i in range(weeks_back):
     wk = last_thu - timedelta(weeks=i)
@@ -135,6 +142,10 @@ for wk in sorted(found, reverse=True):
 print("downloaded:", downloaded or "nothing new")
 print("already in raw:", present)
 print("not published or not found:", missing)
+if errors:
+    print("download errors (server or network problem, not a 404):")
+    for u, why in errors:
+        print("  ", why, u)
 
 # COMMAND ----------
 

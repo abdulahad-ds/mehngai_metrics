@@ -4,11 +4,12 @@
 # environment_version = "6"
 # ///
 # MAGIC %md
-# MAGIC # 01_download_annexures
-# MAGIC Downloads the weekly SPI annexures listed in `spi_weeks_flags.csv` (made by `pbs_spi_scraper.py` on a PC).
+# MAGIC # 01_download_full
+# MAGIC Downloads the weekly SPI annexures listed in `spi_weeks_flags.csv` (initial load and backfills).
 # MAGIC Rule: if a week has an Excel annexure, only the xlsx is saved. If not, the pdf annexure is saved.
-# MAGIC Output folders: `<RAW_FOLDER>/xlsx` and `<RAW_FOLDER>/pdf`. Files are named `Annex_DD.MM.YYYY.<ext>` from the week-ended date.
-# MAGIC Upload the CSV to `<RAW_FOLDER>/manifest/spi_weeks_flags.csv` before running the download cells.
+# MAGIC Output folders are the same ones `03_raw_to_bronze` reads: `RAW_FOLDER` (xlsx) and `RAW_PDF_FOLDER` (pdf) from `00_config`.
+# MAGIC Files are named `Annex_DD.MM.YYYY.<ext>` from the week-ended date.
+# MAGIC Upload the CSV to `/Volumes/workspace/spi/raw/manifest/spi_weeks_flags.csv` before running the download cells.
 
 # COMMAND ----------
 
@@ -23,9 +24,10 @@ from urllib.parse import urlparse, unquote
 
 import requests
 
-XLSX_DIR = f"{RAW_FOLDER}/xlsx"
-PDF_DIR = f"{RAW_FOLDER}/pdf"
-MANIFEST_DIR = f"{RAW_FOLDER}/manifest"
+# Same folders that 03_raw_to_bronze reads (RAW_FOLDER and RAW_PDF_FOLDER already point at the xlsx and pdf folders).
+XLSX_DIR = RAW_FOLDER
+PDF_DIR = RAW_PDF_FOLDER
+MANIFEST_DIR = RAW_FOLDER.rsplit("/", 1)[0] + "/manifest"       # /Volumes/workspace/spi/raw/manifest
 MANIFEST_PATH = f"{MANIFEST_DIR}/spi_weeks_flags.csv"
 
 for d in (XLSX_DIR, PDF_DIR, MANIFEST_DIR):
@@ -99,7 +101,9 @@ def fetch(url):
 # COMMAND ----------
 
 # Connection check: stops early with a clear message if this compute cannot reach pbs.gov.pk.
-first = next(u for _, row in manifest.iterrows() for _, u in candidates(row)[0])
+first = next((u for _, row in manifest.iterrows() for _, u in candidates(row)[0]), None)
+if first is None:
+    raise ValueError("The manifest has no usable annexure link, so there is nothing to download.")
 try:
     r = session.get(first, timeout=30)
     print("connection check:", r.status_code, first)
